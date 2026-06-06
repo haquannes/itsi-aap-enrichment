@@ -153,7 +153,7 @@
         status_code: [200]
       register: hec_resp
       when: hec_token | length > 0
-      no_log: true
+      ignore_errors: true
 
     - name: Confirm HEC delivery
       ansible.builtin.debug:
