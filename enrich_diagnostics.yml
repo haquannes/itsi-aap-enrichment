@@ -19,12 +19,10 @@
     itsi_service: "AAP Managed Nodes"
     kpi: "Image Pull Failure Rate"
     severity: "critical"
-    namespace: "ansible-targets"
-    workload: "ubuntu-target"          # deployment adi
-    workload_kind: "deployment"
+    target_ns: "ansible-targets"        # OCP namespace ('namespace' Ansible'da reserved)
+    workload: "ubuntu-target"           # deployment adi
 
     # --- OCP API erisimi (AAP credential/extra_vars ile saglanir) ---
-    # ocp_api ve ocp_token AAP'de "ITSI Enrichment" credential'indan veya extra_vars'tan gelir.
     ocp_api: "{{ lookup('env', 'OCP_API') | default('https://kubernetes.default.svc', true) }}"
     ocp_token: "{{ lookup('env', 'OCP_TOKEN') | default('', true) }}"
     ocp_validate_certs: false
@@ -47,7 +45,7 @@
     # ---------------------------------------------------------------
     - name: Get deployment spec (desired image)
       ansible.builtin.uri:
-        url: "{{ ocp_api }}/apis/apps/v1/namespaces/{{ namespace }}/deployments/{{ workload }}"
+        url: "{{ ocp_api }}/apis/apps/v1/namespaces/{{ target_ns }}/deployments/{{ workload }}"
         method: GET
         headers:
           Authorization: "Bearer {{ ocp_token }}"
@@ -57,20 +55,25 @@
       register: dep
       ignore_errors: true
 
-    - name: Extract desired image / replica status
+    - name: Mark whether OCP API is reachable/authorized
       ansible.builtin.set_fact:
-        desired_image: "{{ (dep.json.spec.template.spec.containers | map(attribute='image') | list) if dep.json is defined else [] }}"
-        pull_policy: "{{ (dep.json.spec.template.spec.containers | map(attribute='imagePullPolicy') | list) if dep.json is defined else [] }}"
-        replicas_desired: "{{ dep.json.spec.replicas | default('?') if dep.json is defined else '?' }}"
-        replicas_ready: "{{ dep.json.status.readyReplicas | default(0) if dep.json is defined else 0 }}"
-      when: dep is defined
+        ocp_ok: "{{ (dep.status | default(0)) == 200 }}"
+        ocp_http: "{{ dep.status | default(0) }}"
+
+    - name: Extract desired image / replica status (only when 200)
+      ansible.builtin.set_fact:
+        desired_image: "{{ dep.json.spec.template.spec.containers | map(attribute='image') | list }}"
+        pull_policy: "{{ dep.json.spec.template.spec.containers | map(attribute='imagePullPolicy') | list }}"
+        replicas_desired: "{{ dep.json.spec.replicas | default('?') }}"
+        replicas_ready: "{{ dep.json.status.readyReplicas | default(0) }}"
+      when: ocp_ok | bool
 
     # ---------------------------------------------------------------
     # 2) Namespace event'leri (ImagePull / Failed / BackOff kaniti)
     # ---------------------------------------------------------------
     - name: Get namespace events
       ansible.builtin.uri:
-        url: "{{ ocp_api }}/api/v1/namespaces/{{ namespace }}/events?limit=200"
+        url: "{{ ocp_api }}/api/v1/namespaces/{{ target_ns }}/events?limit=200"
         method: GET
         headers:
           Authorization: "Bearer {{ ocp_token }}"
@@ -79,6 +82,7 @@
         status_code: [200, 401, 403, 404]
       register: evs
       ignore_errors: true
+      when: ocp_ok | bool
 
     - name: Filter image-pull / failure events
       ansible.builtin.set_fact:
@@ -90,33 +94,10 @@
           {{ (evs.json['items'] | default([]))
              | selectattr('reason', 'in', ['Failed', 'BackOff', 'ErrImagePull', 'ImagePullBackOff'])
              | map(attribute='count') | map('int') | sum }}
-      when: evs is defined
+      when: ocp_ok | bool and evs is defined and evs.json is defined
 
     # ---------------------------------------------------------------
-    # 3) Etkilenen pod'larin durumu (waiting reason)
-    # ---------------------------------------------------------------
-    - name: Get pods in namespace
-      ansible.builtin.uri:
-        url: "{{ ocp_api }}/api/v1/namespaces/{{ namespace }}/pods"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ ocp_token }}"
-        validate_certs: "{{ ocp_validate_certs }}"
-        return_content: true
-        status_code: [200, 401, 403, 404]
-      register: pods
-      ignore_errors: true
-
-    - name: Summarize pod waiting reasons for this workload
-      ansible.builtin.set_fact:
-        pod_summary: >-
-          {{ (pods.json['items'] | default([]))
-             | selectattr('metadata.name', 'search', workload)
-             | map(attribute='status') | list }}
-      when: pods is defined
-
-    # ---------------------------------------------------------------
-    # 4) Tani ozeti olustur
+    # 3) Tani ozeti olustur (OCP erisilse de erisilmese de calisir)
     # ---------------------------------------------------------------
     - name: Build enrichment payload
       ansible.builtin.set_fact:
@@ -125,11 +106,12 @@
           itsi_service: "{{ itsi_service }}"
           kpi: "{{ kpi }}"
           severity: "{{ severity }}"
-          namespace: "{{ namespace }}"
+          namespace: "{{ target_ns }}"
           workload: "{{ workload }}"
           collected_at: "{{ enrich_started }}"
           collected_by: "AAP ITSI Enrichment job (template launch)"
-          ocp_reachable: "{{ (dep.status | default(0)) == 200 }}"
+          ocp_reachable: "{{ ocp_ok | bool }}"
+          ocp_http_status: "{{ ocp_http }}"
           desired_image: "{{ desired_image | default([]) }}"
           image_pull_policy: "{{ pull_policy | default([]) }}"
           replicas_desired: "{{ replicas_desired | default('?') }}"
@@ -137,7 +119,10 @@
           image_pull_event_count: "{{ pull_event_count | default(0) }}"
           image_pull_messages: "{{ (pull_events | default([]))[:5] }}"
           diagnosis: >-
-            {% if (replicas_ready | default(0) | int) == 0 and (pull_event_count | default(0) | int) > 0 %}
+            {% if not (ocp_ok | bool) %}
+            COLLECTION INCOMPLETE: OCP API returned HTTP {{ ocp_http }} (token invalid/expired or RBAC).
+            Refresh the OCP service-account token in the AAP credential, then re-run enrichment.
+            {% elif (replicas_ready | default(0) | int) == 0 and (pull_event_count | default(0) | int) > 0 %}
             ROOT CAUSE: Image pull failing for {{ desired_image | default(['?']) | join(',') }}
             (pullPolicy={{ pull_policy | default(['?']) | join(',') }}). Registry tag unavailable
             (manifest unknown / pruned). Pod cannot start -> 0/{{ replicas_desired | default('?') }} ready.
@@ -151,7 +136,7 @@
         var: enrichment
 
     # ---------------------------------------------------------------
-    # 5) Splunk HEC'e geri yaz -> ITSI episode drilldown
+    # 4) Splunk HEC'e geri yaz -> ITSI episode drilldown
     # ---------------------------------------------------------------
     - name: Send enrichment to Splunk HEC (otel_logs)
       ansible.builtin.uri:
@@ -172,4 +157,8 @@
 
     - name: Confirm HEC delivery
       ansible.builtin.debug:
-        msg: "Enrichment for episode {{ episode_id }} sent to HEC ({{ hec_index }}/{{ hec_sourcetype }}): {{ hec_resp.json | default('skipped - no hec_token') }}"
+        msg: >-
+          Enrichment for episode {{ episode_id }} ->
+          HEC {{ hec_index }}/{{ hec_sourcetype }}:
+          {{ 'sent' if (hec_resp.status | default(0)) == 200 else 'SKIPPED (no hec_token)' }}
+          | OCP HTTP {{ ocp_http }}
