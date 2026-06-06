@@ -1,0 +1,175 @@
+---
+# ITSI -> AAP closed-loop enrichment playbook
+#
+# ITSI bir episode actiginda (NEAP action) bu job template launch edilir.
+# Playbook, OCP API'sine sorarak bozuk workload hakkinda PLATFORM KANITI toplar
+# (pod/node'a hic dokunmadan; ubuntu-target ImagePullBackOff oldugu icin SSH imkansiz),
+# ve sonucu Splunk HEC ile otel_logs index'ine geri yazar -> ITSI episode drilldown'da gorunur.
+#
+# Tum parametreler extra_vars'tan gelir (ITSI gecer). Asagidaki default'lar elle test icindir.
+
+- name: ITSI enrichment - collect platform evidence for a failing workload
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars:
+    # --- ITSI'in gecdigi episode parametreleri (extra_vars override eder) ---
+    episode_id: "MANUAL-TEST"
+    itsi_service: "AAP Managed Nodes"
+    kpi: "Image Pull Failure Rate"
+    severity: "critical"
+    namespace: "ansible-targets"
+    workload: "ubuntu-target"          # deployment adi
+    workload_kind: "deployment"
+
+    # --- OCP API erisimi (AAP credential/extra_vars ile saglanir) ---
+    # ocp_api ve ocp_token AAP'de "ITSI Enrichment" credential'indan veya extra_vars'tan gelir.
+    ocp_api: "{{ lookup('env', 'OCP_API') | default('https://kubernetes.default.svc', true) }}"
+    ocp_token: "{{ lookup('env', 'OCP_TOKEN') | default('', true) }}"
+    ocp_validate_certs: false
+
+    # --- Splunk HEC geri-yazma ---
+    hec_url: "https://borealis.sekom.local:8088/services/collector/event"
+    hec_token: "{{ lookup('env', 'HEC_TOKEN') | default('', true) }}"
+    hec_index: "otel_logs"
+    hec_sourcetype: "itsi:aap:enrichment"
+    hec_validate_certs: false
+
+  tasks:
+
+    - name: Record start time
+      ansible.builtin.set_fact:
+        enrich_started: "{{ '%Y-%m-%dT%H:%M:%S' | strftime }}"
+
+    # ---------------------------------------------------------------
+    # 1) Hedef workload'in istedigi image:tag (deployment spec)
+    # ---------------------------------------------------------------
+    - name: Get deployment spec (desired image)
+      ansible.builtin.uri:
+        url: "{{ ocp_api }}/apis/apps/v1/namespaces/{{ namespace }}/deployments/{{ workload }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: "{{ ocp_validate_certs }}"
+        return_content: true
+        status_code: [200, 401, 403, 404]
+      register: dep
+      ignore_errors: true
+
+    - name: Extract desired image / replica status
+      ansible.builtin.set_fact:
+        desired_image: "{{ (dep.json.spec.template.spec.containers | map(attribute='image') | list) if dep.json is defined else [] }}"
+        pull_policy: "{{ (dep.json.spec.template.spec.containers | map(attribute='imagePullPolicy') | list) if dep.json is defined else [] }}"
+        replicas_desired: "{{ dep.json.spec.replicas | default('?') if dep.json is defined else '?' }}"
+        replicas_ready: "{{ dep.json.status.readyReplicas | default(0) if dep.json is defined else 0 }}"
+      when: dep is defined
+
+    # ---------------------------------------------------------------
+    # 2) Namespace event'leri (ImagePull / Failed / BackOff kaniti)
+    # ---------------------------------------------------------------
+    - name: Get namespace events
+      ansible.builtin.uri:
+        url: "{{ ocp_api }}/api/v1/namespaces/{{ namespace }}/events?limit=200"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: "{{ ocp_validate_certs }}"
+        return_content: true
+        status_code: [200, 401, 403, 404]
+      register: evs
+      ignore_errors: true
+
+    - name: Filter image-pull / failure events
+      ansible.builtin.set_fact:
+        pull_events: >-
+          {{ (evs.json['items'] | default([]))
+             | selectattr('reason', 'in', ['Failed', 'BackOff', 'ErrImagePull', 'ImagePullBackOff'])
+             | map(attribute='message') | list | unique }}
+        pull_event_count: >-
+          {{ (evs.json['items'] | default([]))
+             | selectattr('reason', 'in', ['Failed', 'BackOff', 'ErrImagePull', 'ImagePullBackOff'])
+             | map(attribute='count') | map('int') | sum }}
+      when: evs is defined
+
+    # ---------------------------------------------------------------
+    # 3) Etkilenen pod'larin durumu (waiting reason)
+    # ---------------------------------------------------------------
+    - name: Get pods in namespace
+      ansible.builtin.uri:
+        url: "{{ ocp_api }}/api/v1/namespaces/{{ namespace }}/pods"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: "{{ ocp_validate_certs }}"
+        return_content: true
+        status_code: [200, 401, 403, 404]
+      register: pods
+      ignore_errors: true
+
+    - name: Summarize pod waiting reasons for this workload
+      ansible.builtin.set_fact:
+        pod_summary: >-
+          {{ (pods.json['items'] | default([]))
+             | selectattr('metadata.name', 'search', workload)
+             | map(attribute='status') | list }}
+      when: pods is defined
+
+    # ---------------------------------------------------------------
+    # 4) Tani ozeti olustur
+    # ---------------------------------------------------------------
+    - name: Build enrichment payload
+      ansible.builtin.set_fact:
+        enrichment:
+          episode_id: "{{ episode_id }}"
+          itsi_service: "{{ itsi_service }}"
+          kpi: "{{ kpi }}"
+          severity: "{{ severity }}"
+          namespace: "{{ namespace }}"
+          workload: "{{ workload }}"
+          collected_at: "{{ enrich_started }}"
+          collected_by: "AAP ITSI Enrichment job (template launch)"
+          ocp_reachable: "{{ (dep.status | default(0)) == 200 }}"
+          desired_image: "{{ desired_image | default([]) }}"
+          image_pull_policy: "{{ pull_policy | default([]) }}"
+          replicas_desired: "{{ replicas_desired | default('?') }}"
+          replicas_ready: "{{ replicas_ready | default(0) }}"
+          image_pull_event_count: "{{ pull_event_count | default(0) }}"
+          image_pull_messages: "{{ (pull_events | default([]))[:5] }}"
+          diagnosis: >-
+            {% if (replicas_ready | default(0) | int) == 0 and (pull_event_count | default(0) | int) > 0 %}
+            ROOT CAUSE: Image pull failing for {{ desired_image | default(['?']) | join(',') }}
+            (pullPolicy={{ pull_policy | default(['?']) | join(',') }}). Registry tag unavailable
+            (manifest unknown / pruned). Pod cannot start -> 0/{{ replicas_desired | default('?') }} ready.
+            Remediation: re-push or correct image tag in registry, then rollout restart.
+            {% else %}
+            No conclusive image-pull root cause from platform evidence; review collected events.
+            {% endif %}
+
+    - name: Show enrichment (job output)
+      ansible.builtin.debug:
+        var: enrichment
+
+    # ---------------------------------------------------------------
+    # 5) Splunk HEC'e geri yaz -> ITSI episode drilldown
+    # ---------------------------------------------------------------
+    - name: Send enrichment to Splunk HEC (otel_logs)
+      ansible.builtin.uri:
+        url: "{{ hec_url }}"
+        method: POST
+        headers:
+          Authorization: "Splunk {{ hec_token }}"
+        body_format: json
+        body:
+          index: "{{ hec_index }}"
+          sourcetype: "{{ hec_sourcetype }}"
+          event: "{{ enrichment }}"
+        validate_certs: "{{ hec_validate_certs }}"
+        status_code: [200]
+      register: hec_resp
+      when: hec_token | length > 0
+      no_log: true
+
+    - name: Confirm HEC delivery
+      ansible.builtin.debug:
+        msg: "Enrichment for episode {{ episode_id }} sent to HEC ({{ hec_index }}/{{ hec_sourcetype }}): {{ hec_resp.json | default('skipped - no hec_token') }}"
