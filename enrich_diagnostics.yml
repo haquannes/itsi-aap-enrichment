@@ -119,18 +119,18 @@
           replicas_ready: "{{ replicas_ready | default(0) }}"
           image_pull_event_count: "{{ pull_event_count | default(0) }}"
           image_pull_messages: "{{ (pull_events | default([]))[:5] }}"
-          diagnosis: >-
-            {% if not (ocp_ok | bool) %}
-            COLLECTION INCOMPLETE: OCP API returned HTTP {{ ocp_http }} (token invalid/expired or RBAC).
-            Refresh the OCP service-account token in the AAP credential, then re-run enrichment.
-            {% elif (replicas_ready | default(0) | int) == 0 and (pull_event_count | default(0) | int) > 0 %}
-            ROOT CAUSE: Image pull failing for {{ desired_image | default(['?']) | join(',') }}
-            (pullPolicy={{ pull_policy | default(['?']) | join(',') }}). Registry tag unavailable
-            (manifest unknown / pruned). Pod cannot start -> 0/{{ replicas_desired | default('?') }} ready.
-            Remediation: re-push or correct image tag in registry, then rollout restart.
-            {% else %}
-            No conclusive image-pull root cause from platform evidence; review collected events.
-            {% endif %}
+          # OpenShift'in KENDI ham hata mesaji (Failed event'inden, birebir - yorum yok)
+          latest_pull_error: "{{ (pull_events | default([]) | select('search', 'Failed to pull') | list | first) | default('') }}"
+          # collection_status: sadece toplama islemi durumu (yorum degil)
+          collection_status: >-
+            {% if ocp_ok | bool %}OK (OCP API HTTP 200){% else %}INCOMPLETE (OCP API HTTP {{ ocp_http }} - token/RBAC){% endif %}
+          # observed_facts: SADECE olculen gercekler, cikarim/yorum YOK
+          observed_facts: >-
+            {% if ocp_ok | bool %}desired_image={{ desired_image | default(['?']) | join(',') }};
+            imagePullPolicy={{ pull_policy | default(['?']) | join(',') }};
+            replicas ready={{ replicas_ready | default(0) }}/{{ replicas_desired | default('?') }};
+            imagePull/Failed events (cumulative)={{ pull_event_count | default(0) }}{% else %}
+            OCP API not reachable/authorized (HTTP {{ ocp_http }}); no platform facts collected{% endif %}
 
     - name: Show enrichment (job output)
       ansible.builtin.debug:
