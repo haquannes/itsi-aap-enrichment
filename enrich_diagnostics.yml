@@ -119,8 +119,8 @@
           replicas_ready: "{{ replicas_ready | default(0) }}"
           image_pull_event_count: "{{ pull_event_count | default(0) }}"
           image_pull_messages: "{{ (pull_events | default([]))[:5] }}"
-          # OpenShift'in KENDI ham hata mesaji (Failed event'inden, birebir - yorum yok)
-          latest_pull_error: "{{ (pull_events | default([]) | select('search', 'Failed to pull') | list | first) | default('') }}"
+          # OpenShift'in KENDI ham hata mesaji (bu workload'a ait Failed event'i, birebir - yorum yok)
+          latest_pull_error: "{{ (pull_events | default([]) | select('search', 'Failed to pull') | select('search', workload) | list | first) | default((pull_events | default([]) | select('search', 'Failed to pull') | list | first) | default('')) }}"
           # collection_status: sadece toplama islemi durumu (yorum degil)
           collection_status: >-
             {% if ocp_ok | bool %}OK (OCP API HTTP 200){% else %}INCOMPLETE (OCP API HTTP {{ ocp_http }} - token/RBAC){% endif %}
